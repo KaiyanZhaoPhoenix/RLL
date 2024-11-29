@@ -1,0 +1,8 @@
+gymnasium
+ale-py
+wandb
+pyyaml
+numpy
+matplotlib
+pandas
+tensorboard
