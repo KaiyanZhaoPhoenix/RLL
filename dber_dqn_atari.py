@@ -4,8 +4,15 @@ import time
 import wandb
 import argparse
 import torch
+import psutil
+import os
 from envs.atari_env import create_atari_env
 from algo.atari_dber_dqn.dber_dqn import DBERDQN
+
+def monitor_memory():
+    """监控内存使用情况"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024  # 转换为MB
 
 def set_seed(seed: int):
     """设置随机种子，确保实验可重复性"""
@@ -20,12 +27,29 @@ def initialize_wandb(args):
     run = wandb.init(
         project="gen",
         config=vars(args),
-        name=f"dber_dqn_{args.env}_{args.seed}_{int(time.time())}",
+        name=f"dber__dqn_{args.env}_{args.seed}_{int(time.time())}",
         monitor_gym=True,
-        save_code=True,
         sync_tensorboard=True,
+        save_code=True,
     )
     return run
+
+def train_callback(_locals, _globals):
+    """训练过程中的回调函数，用于监控和记录"""
+    if _locals['self'].num_timesteps % 1000 == 0:
+        current_memory = monitor_memory()
+        print(f"Step: {_locals['self'].num_timesteps}, Memory: {current_memory:.2f} MB")
+        
+        # 获取并记录多样性指标
+        diversity_stats = _locals['self'].replay_buffer.get_statistics()
+        wandb.log({
+            "memory_usage": current_memory,
+            "mean_diversity": diversity_stats['mean_diversity'],
+            "max_diversity": diversity_stats['max_diversity'],
+            "min_diversity": diversity_stats['min_diversity'],
+            "buffer_size": diversity_stats['size'],
+        }, step=_locals['self'].num_timesteps)
+    return True
 
 def main(args):
     """主训练循环"""
@@ -49,29 +73,38 @@ def main(args):
         policy="CnnPolicy",
         env=env,
         learning_rate=args.learning_rate,
-        buffer_size=50000,
-        learning_starts=10000,
+        buffer_size=args.buffer_size,
+        learning_starts=args.learning_starts,
         batch_size=args.batch_size,
         tau=args.tau,
         gamma=args.gamma,
         train_freq=args.train_freq,
         gradient_steps=args.gradient_steps,
-        segment_length=args.segment_length,  # DBER特有参数
+        segment_length=args.segment_length,
         target_update_interval=args.target_update_interval,
         exploration_fraction=args.exploration_fraction,
         exploration_initial_eps=args.exploration_initial_eps,
         exploration_final_eps=args.exploration_final_eps,
         max_grad_norm=args.max_grad_norm,
         tensorboard_log="./tensorboard_log" if args.use_wandb else None,
-        verbose=1,
         device=device,
+        verbose=1,
     )
+    
+    # 打印初始内存使用
+    print(f"Initial memory usage: {monitor_memory():.2f} MB")
     
     # 开始训练
-    model.learn(
-        total_timesteps=args.total_timesteps,
-    )
-    
+    try:
+        model.learn(
+            total_timesteps=args.total_timesteps,
+        )
+    except Exception as e:
+        print(f"Training interrupted: {e}")
+        if args.use_wandb:
+            wandb.finish(exit_code=1)
+        raise e
+
     # 关闭环境
     env.close()
     
@@ -89,13 +122,13 @@ if __name__ == "__main__":
                        help="Random seed for reproducibility")
     
     # 训练参数
-    parser.add_argument("--total_timesteps", type=int, default=10_000_000,
+    parser.add_argument("--total_timesteps", type=int, default=1_000_000,
                        help="Total timesteps to train")
     parser.add_argument("--learning_rate", type=float, default=1e-4,
                        help="Learning rate")
-    parser.add_argument("--buffer_size", type=int, default=500,
+    parser.add_argument("--buffer_size", type=int, default=5000,
                        help="Size of the replay buffer")
-    parser.add_argument("--learning_starts", type=int, default=10000,
+    parser.add_argument("--learning_starts", type=int, default=1000,
                        help="How many steps before learning starts")
     parser.add_argument("--batch_size", type=int, default=32,
                        help="Minibatch size")
@@ -107,7 +140,7 @@ if __name__ == "__main__":
                        help="Update the model every `train_freq` steps")
     parser.add_argument("--gradient_steps", type=int, default=1,
                        help="How many gradient steps to do after each rollout")
-    parser.add_argument("--target_update_interval", type=int, default=10_000,
+    parser.add_argument("--target_update_interval", type=int, default=1000,
                        help="Update the target network every `target_update_interval` steps")
     
     # 探索参数
@@ -123,16 +156,22 @@ if __name__ == "__main__":
     # DBER特有参数
     parser.add_argument("--segment_length", type=int, default=2,
                        help="Length of trajectory segments")
+    parser.add_argument("--clip_diversity", type=float, default=1.0,
+                       help="Maximum diversity score")
     
     # 其他设置
     parser.add_argument("--use_cuda", type=bool, default=True,
                        help="Enable CUDA training if available")
     parser.add_argument("--use_wandb", type=bool, default=True,
                        help="Enable Weights & Biases logging")
+    parser.add_argument("--save_model", type=bool, default=True,
+                       help="Save the trained model")
+    parser.add_argument("--max_memory_mb", type=int, default=2000,
+                       help="Maximum memory usage in MB")
     
     args = parser.parse_args()
     
     training_start_time = time.time()
     main(args)
     training_duration = time.time() - training_start_time
-    print(f"训练完成，总用时: {training_duration / 3600:.2f} 小时") 
+    print(f"训练完成，总用时: {training_duration / 3600:.2f} 小时")
